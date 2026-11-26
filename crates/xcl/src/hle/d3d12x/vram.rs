@@ -236,13 +236,13 @@ struct Target {
 }
 
 /// The tiles of a texture whose levels get video memory when an upload first has texels for
-/// them (`level_pages`): a group for each level with tiles of its own, in order, then one for
-/// the packed levels.
+/// them (`level_pages`): a group for each level with tiles of its own, in subresource order,
+/// then one for the packed levels of each array slice.
 #[derive(Clone, Debug, PartialEq)]
 struct Levels {
     /// (the group's first subresource, its first tile in the resource, its tiles, mapped)
     groups: Vec<(u32, u32, u32, bool)>,
-    /// the texture's levels (the last group's go up to here)
+    /// the texture's subresources (the last group's levels go up to here)
     mips: u32,
 }
 
@@ -267,6 +267,22 @@ impl Levels {
         (next == total && !groups.is_empty()).then_some(Levels { groups, mips })
     }
 
+    /// Repeat one slice's tiling in D3D12 subresource order. Packed-mip tile counts and offsets
+    /// are per slice; every slice occupies `total / slices` tiles, including its packed tail.
+    fn array(standard: &[(u32, u32)], packed: Option<(u32, u32)>, total: u32, mips: u32, slices: u32) -> Option<Levels> {
+        let stride = total.checked_div(slices)?;
+        if total % slices != 0 || mips == 0 {
+            return None;
+        }
+        let one = Self::new(standard, packed, stride, mips)?;
+        let subresources = mips.checked_mul(slices)?;
+        let mut groups = Vec::new();
+        for slice in 0..slices {
+            groups.extend(one.groups.iter().map(|&(sub, first, n, mapped)| (sub + slice * mips, first + slice * stride, n, mapped)));
+        }
+        Some(Levels { groups, mips: subresources })
+    }
+
     /// The levels of group `k`.
     fn levels_of(&self, k: usize) -> std::ops::Range<u32> {
         self.groups[k].0..self.groups.get(k + 1).map_or(self.mips, |g| g.0)
@@ -278,7 +294,7 @@ impl Levels {
     }
 }
 
-/// `XCL_TEXTURE_LEVEL_PAGES=1` (off by default): a sampled 2D texture of one slice on the
+/// `XCL_TEXTURE_LEVEL_PAGES=1` (off by default): a sampled 2D texture, array or cube on the
 /// shared pages gets the pages of a level when an upload first has texels for it. A retail game
 /// places its streamed textures at full size and maps memory under their levels as it loads
 /// them, the small ones first; with a page for every 64 KiB a texture covers most of the pages
@@ -321,11 +337,12 @@ impl Levels {
 }
 
 /// The tiling of reserved texture `res` of `mips` levels as `Levels`, and its tiles in all.
-unsafe fn level_tiling(dev: &ID3D12Device, res: &ID3D12Resource, mips: u32) -> (Option<Levels>, u32) {
+unsafe fn level_tiling(dev: &ID3D12Device, res: &ID3D12Resource, mips: u32, slices: u32) -> (Option<Levels>, u32) {
     let mut total = 0u32;
     let mut packed = D3D12_PACKED_MIP_INFO::default();
-    let mut n = mips;
-    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); mips as usize];
+    let Some(subresources) = mips.checked_mul(slices) else { return (None, 0) };
+    let mut n = subresources;
+    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); subresources as usize];
     dev.GetResourceTiling(res, Some(&mut total), Some(&mut packed), None, Some(&mut n), 0, tilings.as_mut_ptr());
     let standard: Vec<(u32, u32)> = tilings
         .iter()
@@ -333,8 +350,16 @@ unsafe fn level_tiling(dev: &ID3D12Device, res: &ID3D12Resource, mips: u32) -> (
         .map(|t| (t.StartTileIndexInOverallResource, t.WidthInTiles * t.HeightInTiles as u32 * t.DepthInTiles as u32))
         .collect();
     let tail = (packed.NumPackedMips > 0).then_some((packed.StartTileIndexInOverallResource, packed.NumTilesForPackedMips));
-    let whole = standard.len() == packed.NumStandardMips as usize && packed.NumStandardMips as u32 + packed.NumPackedMips as u32 == mips;
-    (if whole { Levels::new(&standard, tail, total, mips) } else { None }, total)
+    let whole = n == subresources && standard.len() == packed.NumStandardMips as usize && packed.NumStandardMips as u32 + packed.NumPackedMips as u32 == mips;
+    let levels = if whole { Levels::array(&standard, tail, total, mips, slices) } else { None };
+    // Check the reported standard tiles of every slice against the repeated layout too. An
+    // unexpected driver layout falls back to eager backing instead of mapping the wrong slice.
+    let levels = levels.filter(|l| l.groups.iter().all(|&(sub, first, count, _)| {
+        if sub % mips >= packed.NumStandardMips as u32 { return true; }
+        let t = &tilings[sub as usize];
+        t.StartTileIndexInOverallResource == first && t.WidthInTiles * t.HeightInTiles as u32 * t.DepthInTiles as u32 == count
+    }));
+    (levels, total)
 }
 
 /// Per-heap free-tile allocator for `Pages`.
@@ -1013,7 +1038,7 @@ unsafe fn place_on_pages(
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
     let levels = if lazy {
-        let (levels, n) = level_tiling(dev, res, desc.MipLevels as u32);
+        let (levels, n) = level_tiling(dev, res, desc.MipLevels as u32, desc.DepthOrArraySize as u32);
         total = n;
         levels.filter(|_| total > 0 && owned_pages(va, console_bytes, total as usize).is_some())
     } else {
@@ -1327,8 +1352,7 @@ pub unsafe fn place_pages(
     if console_has_packed_3d_mips(desc) {
         return None;
     }
-    // (one slice: the tiles of an array's packed levels are not asked about here)
-    let lazy = level_pages() && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
+    let lazy = level_pages() && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, lazy, riid, ppv)
 }
 
@@ -1489,6 +1513,156 @@ mod tests {
         assert_eq!(Levels::new(&[(0, 4), (4, 1)], None, 6, 2), None);
         assert_eq!(Levels::new(&[(0, 4), (4, 0)], None, 4, 2), None);
         assert_eq!(Levels::new(&[], None, 0, 1), None);
+    }
+
+    #[test]
+    fn array_levels_keep_each_slices_standard_tiles_and_packed_tail_separate() {
+        // Two slices, four levels each: 4 tiles for mip 0, then 2 for that slice's tail.
+        let l = Levels::array(&[(0, 4)], Some((4, 2)), 12, 4, 2).unwrap();
+        assert_eq!(l.groups, [(0, 0, 4, false), (1, 4, 2, false), (4, 6, 4, false), (5, 10, 2, false)]);
+        assert_eq!((0..8).map(|i| l.group_of(i)).collect::<Vec<_>>(), [0, 1, 1, 1, 2, 3, 3, 3]);
+        assert_eq!((l.levels_of(1), l.levels_of(2), l.levels_of(3)), (1..4, 4..5, 5..8));
+        // A cube whose faces are entirely packed still has six independently mapped tails.
+        let cube = Levels::array(&[], Some((0, 2)), 12, 3, 6).unwrap();
+        assert_eq!(cube.groups.len(), 6);
+        for face in 0..6usize {
+            assert_eq!(cube.groups[face], (face as u32 * 3, face as u32 * 2, 2, false));
+            assert_eq!(cube.levels_of(face), face as u32 * 3..face as u32 * 3 + 3);
+        }
+        let plain = Levels::array(&[(0, 4), (4, 1)], None, 10, 2, 2).unwrap();
+        assert_eq!(plain.groups, [(0, 0, 4, false), (1, 4, 1, false), (2, 5, 4, false), (3, 9, 1, false)]);
+        assert_eq!(Levels::array(&[(0, 4)], Some((4, 2)), 13, 4, 2), None);
+        assert_eq!(Levels::array(&[(0, 4)], Some((5, 1)), 12, 4, 2), None);
+        assert_eq!(Levels::array(&[(0, 4)], None, 4, 1, 0), None);
+        assert_eq!(Levels::array(&[(0, 4)], None, 8, 0, 2), None);
+        assert_eq!(Levels::array(&[], Some((0, 1)), 2, u32::MAX, 2), None);
+    }
+
+    /// Array slices and cube faces start without pages, then get only the requested mip or
+    /// packed tail. Copies into every unmapped subresource must still read back as zero.
+    #[test]
+    fn gpu_lazy_array_pages_preserve_each_mip_and_face() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::gpu::{recomp::runner, texture};
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        struct Lazy;
+        impl Drop for Lazy { fn drop(&mut self) { LEVEL_PAGES_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed); } }
+        let Ok(dev) = runner::device() else { return runner::skip_test("no GPU") };
+        unsafe {
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2 || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0 {
+                return runner::skip_test("array pages need resource heap tier 2 and tiled tier 2");
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let riid = &ID3D12Resource::IID as *const _ as *const windows_sys::core::GUID;
+            for slices in [2u16, 6] {
+                let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 256, Height: 256, DepthOrArraySize: slices, MipLevels: 9, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+                let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..desc };
+                let mut probe: Option<ID3D12Resource> = None;
+                if let Err(e) = dev.CreateReservedResource(&tiled, D3D12_RESOURCE_STATE_COPY_SOURCE, None, &mut probe) {
+                    assert!(matches!(e.code().0 as u32, 0x8007_0057 | 0x887A_0004), "reserved array creation failed: {e}");
+                    runner::skip_test(&format!("adapter refuses a reserved {slices}-slice texture with packed mips: {e}"));
+                    continue;
+                }
+                assert!(probe.is_some(), "successful reserved array creation returned no resource");
+                let (mut total, mut packed, mut n, mut top) = (0u32, D3D12_PACKED_MIP_INFO::default(), 1u32, D3D12_SUBRESOURCE_TILING::default());
+                dev.GetResourceTiling(probe.as_ref().unwrap(), Some(&mut total), Some(&mut packed), None, Some(&mut n), 9, &mut top);
+                drop(probe);
+                assert!(n == 1 && packed.NumStandardMips > 0 && packed.NumPackedMips > 0);
+                let top_tiles = top.WidthInTiles * top.HeightInTiles as u32 * top.DepthInTiles as u32;
+                LEVEL_PAGES_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+                let lazy = Lazy;
+                let mut raw = std::ptr::null_mut();
+                let va = 0x63_0000_0000usize + slices as usize * 0x100_0000;
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32, std::ptr::null(), Some(total as u64 * PAGE as u64), riid, &mut raw);
+                drop(lazy);
+                assert!(hr.is_some_and(|h| h >= 0) && !raw.is_null());
+                let res = ID3D12Resource::from_raw(raw);
+                assert!(has_lazy_levels(raw as usize), "reserved {slices}-slice texture must use lazy mip pages");
+                let mapped_bytes = || {
+                    let g = PAGES.lock().unwrap();
+                    let t = &g[&(dev.as_raw() as usize)].as_ref().unwrap().targets[&(raw as usize)];
+                    (t.used.len() + t.used_extra.len()) * PAGE
+                };
+                assert_eq!(mapped_bytes(), 0, "placing an array must not allocate all its mip pages");
+                let subs: Vec<texture::Subresource> = (0..slices as usize * 9).map(|sub| {
+                    let side = (256usize >> (sub % 9)).max(1);
+                    // A packed tail has one nonzero mip and zero siblings that must also be
+                    // initialized when the whole tail receives pages.
+                    let value = if sub % 9 >= packed.NumStandardMips as usize && sub % 9 != 8 { 0 } else { 1 + sub as u8 };
+                    texture::Subresource { rows: side, row_bytes: side * 4, depth: 1, data: vec![value; side * side * 4] }
+                }).collect();
+                let check_pixels = |resident: &[bool]| {
+                    let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs.len()];
+                    let mut bytes = 0u64;
+                    dev.GetCopyableFootprints(&desc, 0, subs.len() as u32, 0, Some(fps.as_mut_ptr()), None, None, Some(&mut bytes));
+                    let buffer = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: desc.SampleDesc, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                    let mut rb: Option<ID3D12Resource> = None;
+                    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+                    let rb = rb.unwrap();
+                    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                    for (sub, fp) in fps.iter().enumerate() {
+                        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&res), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub as u32 } };
+                        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
+                        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                    }
+                    list.Close().unwrap();
+                    before_execute(&queue);
+                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                    texture::wait(&dev, &queue).unwrap();
+                    let mut ptr = std::ptr::null_mut();
+                    rb.Map(0, None, Some(&mut ptr)).unwrap();
+                    for (sub, (s, fp)) in subs.iter().zip(&fps).enumerate() {
+                        let expected = if resident[sub] { s.data[0] } else { 0 };
+                        for row in 0..s.rows {
+                            let got = std::slice::from_raw_parts((ptr as *const u8).add(fp.Offset as usize + row * fp.Footprint.RowPitch as usize), s.row_bytes);
+                            assert!(got.iter().all(|&b| b == expected), "{slices} slices, subresource {sub}, row {row}: expected {expected}");
+                        }
+                    }
+                    rb.Unmap(0, None);
+                };
+                let upload = || {
+                    before_execute(&queue);
+                    texture::upload(&dev, &queue, &res, &subs, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE).unwrap();
+                };
+                let mut resident = vec![false; subs.len()];
+                check_pixels(&resident);
+                assert_eq!(map_levels(&res, Some(&[9])), [9], "only slice 1 mip 0");
+                resident[9] = true;
+                upload();
+                assert_eq!(mapped_bytes(), top_tiles as usize * PAGE);
+                println!("lazy array {slices} slices: full {} bytes, first mip mapped {} bytes", total as usize * PAGE, mapped_bytes());
+                check_pixels(&resident);
+                let tail_start = (slices as u32 - 1) * 9 + packed.NumStandardMips as u32;
+                let tail_end = slices as u32 * 9;
+                assert_eq!(map_levels(&res, Some(&[tail_end - 1])), (tail_start..tail_end).collect::<Vec<_>>());
+                resident[tail_start as usize..tail_end as usize].fill(true);
+                upload();
+                assert_eq!(mapped_bytes(), (top_tiles + packed.NumTilesForPackedMips) as usize * PAGE);
+                check_pixels(&resident);
+                map_levels(&res, None);
+                resident.fill(true);
+                upload();
+                assert_eq!(mapped_bytes(), total as usize * PAGE);
+                assert!(!has_unmapped_levels(raw as usize));
+                check_pixels(&resident);
+                // Mapping the same subresources again neither duplicates pages nor repeats work.
+                assert!(map_levels(&res, None).is_empty());
+                assert_eq!(mapped_bytes(), total as usize * PAGE);
+                unmap_superseded(&res);
+                assert_eq!(mapped_bytes(), 0);
+                assert!(remap_if_unmapped(&res));
+                assert_eq!(mapped_bytes(), 0, "remapping a lazy array leaves its groups unmapped");
+                assert_eq!(map_levels(&res, None).len(), subs.len());
+                upload();
+                assert_eq!(mapped_bytes(), total as usize * PAGE);
+                check_pixels(&resident);
+                forget(raw as usize);
+            }
+        }
     }
 
     #[test]

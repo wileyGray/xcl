@@ -2421,7 +2421,7 @@ unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) -> Ve
     if !super::vram::has_lazy_levels(r.as_raw() as usize) {
         return Vec::new();
     }
-    // (one slice: its subresources are its levels)
+    // D3D12 order: mip + array slice * mip count, including a separate packed tail per slice.
     let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
     super::vram::map_levels(r, Some(&present))
 }

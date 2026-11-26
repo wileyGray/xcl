@@ -323,6 +323,10 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   fills into its GPU views) are applied: a GPU-view page shows the physical page mapped into it.
   `XCL_PAGE_MAPPINGS=0` turns them off (the call is ignored and a GPU-view page shows its CPU view at
   the same offset, as before).
+- `XCL_TEXTURE_LEVEL_PAGES=1` gives sampled 2D textures, arrays and cubemaps video-memory pages
+  as their mip levels acquire texels, including a separate packed mip tail for each array slice.
+  It is off by default; supported tiled textures start without pages, and GPU-written textures
+  receive all their pages before use.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
